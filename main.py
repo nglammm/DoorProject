@@ -1,9 +1,12 @@
 import os
 import time
 import threading
+import hashlib
 import cv2
 import face_recognition
 import numpy as np
+from gtts import gTTS
+import pygame
 
 from extend_actuator import extend
 from retract_actuator import retract
@@ -11,6 +14,7 @@ from retract_actuator import retract
 # --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FACES_DIR = os.path.join(BASE_DIR, "faces")
+TTS_CACHE_DIR = os.path.join(BASE_DIR, "tts_cache")
 CAMERA_INDEX = 0           # Default USB webcam
 ACTUATOR_DURATION = 30     # Seconds to extend/retract
 OPEN_DELAY = 5             # Seconds to wait before closing
@@ -18,16 +22,74 @@ MIN_AUTHORITY = 2          # Minimum authority level required to open the door
 PROCESS_EVERY_N_FRAMES = 4 # Process 1 out of N frames to keep RPi 5 CPU cool
 DISPLAY_VIDEO = False      # MUST be False when running as a background systemd service
 
-# State tracking for the door thread
+# Debounce interval in seconds (prevents repeating speech on consecutive frames)
+TTS_COOLDOWN = 6.0
+
+# Initialize Pygame Mixer for non-blocking playback
+pygame.mixer.init()
+if not os.path.exists(TTS_CACHE_DIR):
+    os.makedirs(TTS_CACHE_DIR)
+
+# Locks and state flags
 door_lock = threading.Lock()
 is_door_busy = False
 
+tts_lock = threading.Lock()
+is_speaking = False
+last_speech_time = 0.0
+
+
+# --- Vietnamese Text-to-Speech Functions ---
+
+def _play_tts_worker(text):
+    """
+    Worker function to fetch/cache MP3 and play via pygame mixer.
+    """
+    global is_speaking, last_speech_time
+    try:
+        # Cache file based on MD5 of text to avoid re-downloading on every scan
+        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+        cache_path = os.path.join(TTS_CACHE_DIR, f"{text_hash}.mp3")
+
+        if not os.path.exists(cache_path):
+            tts = gTTS(text=text, lang='vi')
+            tts.save(cache_path)
+
+        pygame.mixer.music.load(cache_path)
+        pygame.mixer.music.play()
+
+        # Wait until playback finishes before releasing the lock
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+
+    except Exception as e:
+        print(f"[TTS ERROR] Failed to speak '{text}': {e}", flush=True)
+    finally:
+        with tts_lock:
+            last_speech_time = time.time()
+            is_speaking = False
+
+
+def speak_vn_async(text, force=False):
+    """
+    Non-blocking TTS trigger with cooldown to avoid spamming the audio device.
+    """
+    global is_speaking, last_speech_time
+    with tts_lock:
+        now = time.time()
+        if is_speaking:
+            return
+        if not force and (now - last_speech_time) < TTS_COOLDOWN:
+            return
+        is_speaking = True
+
+    thread = threading.Thread(target=_play_tts_worker, args=(text,), daemon=True)
+    thread.start()
+
+
+# --- Face Recognition & Door Control ---
 
 def load_known_faces(directory):
-    """
-    Loads face encodings from '<name>_<authority_level>_<photo_number>.png'
-    Example: 'alice_3_1.png', 'alice_3_2.png', 'bob_2_1.png'
-    """
     known_encodings = []
     known_names = []
     known_authorities = []
@@ -41,13 +103,11 @@ def load_known_faces(directory):
     for filename in sorted(os.listdir(directory)):
         if filename.lower().endswith((".png", ".jpg", ".jpeg")):
             base_name = os.path.splitext(filename)[0]
-            
-            # Split from the right up to 2 times: [<name>, <authority_level>, <photo_number>]
             parts = base_name.rsplit("_", 2)
+            
             if len(parts) == 3:
                 name, auth_str, photo_num = parts
             elif len(parts) == 2:
-                # Backward compatibility for '<name>_<authority_level>'
                 name, auth_str = parts
                 photo_num = "1"
             else:
@@ -77,11 +137,15 @@ def load_known_faces(directory):
 
 def operate_door(person_name, authority):
     """
-    Executes the door open -> wait -> close sequence in a background thread.
+    Executes door cycle in background thread and triggers welcome greeting.
     """
     global is_door_busy
     try:
         print(f"\n[ACCESS GRANTED] Welcome {person_name} (Authority: {authority}).", flush=True)
+
+        # Trigger welcome voice in Vietnamese
+        speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
+
         print(f"[DOOR] Opening door for {ACTUATOR_DURATION} seconds...", flush=True)
         retract(duration=ACTUATOR_DURATION)
 
@@ -100,9 +164,6 @@ def operate_door(person_name, authority):
 
 
 def trigger_door_async(person_name, authority):
-    """
-    Checks if the door is already moving; if not, launches the door thread.
-    """
     global is_door_busy
     with door_lock:
         if is_door_busy:
@@ -172,13 +233,19 @@ def main():
                             name = known_names[best_match_index]
                             authority = known_authorities[best_match_index]
 
-                            if authority >= MIN_AUTHORITY:
-                                color = (0, 255, 0)
-                                trigger_door_async(name, authority)
+                    # Decision logic for authority & voice
+                    if name != "Unknown" and authority >= MIN_AUTHORITY:
+                        color = (0, 255, 0)
+                        trigger_door_async(name, authority)
+                    else:
+                        # Triggers for either Unknown faces or known faces with authority < MIN_AUTHORITY
+                        if not is_door_busy:
+                            if name == "Unknown":
+                                print("[ACCESS DENIED] Unknown person detected.", flush=True)
                             else:
-                                color = (0, 165, 255)
-                                if not is_door_busy:
-                                    print(f"[ACCESS DENIED] {name} (Authority {authority} < {MIN_AUTHORITY})", flush=True)
+                                print(f"[ACCESS DENIED] {name} (Authority {authority} < {MIN_AUTHORITY})", flush=True)
+                            
+                            speak_vn_async("cút ra ngoài")
 
                     label = f"{name} (Lvl {authority})" if name != "Unknown" else "Unknown"
                     face_labels.append(label)

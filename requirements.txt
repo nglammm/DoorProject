@@ -1,3 +1,5 @@
 face_recognition
 numpy
 opencv-python
+ggts
+pygame
