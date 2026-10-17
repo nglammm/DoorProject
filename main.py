@@ -83,13 +83,13 @@ def operate_door(person_name, authority):
     try:
         print(f"\n[ACCESS GRANTED] Welcome {person_name} (Authority: {authority}).", flush=True)
         print(f"[DOOR] Opening door for {ACTUATOR_DURATION} seconds...", flush=True)
-        extend(duration=ACTUATOR_DURATION)
+        retract(duration=ACTUATOR_DURATION)
 
         print(f"[DOOR] Door fully open. Waiting {OPEN_DELAY} seconds...", flush=True)
         time.sleep(OPEN_DELAY)
 
         print(f"[DOOR] Closing door for {ACTUATOR_DURATION} seconds...", flush=True)
-        retract(duration=ACTUATOR_DURATION)
+        extend(duration=ACTUATOR_DURATION)
 
         print("[DOOR] Door cycle complete. Ready for next scan.\n", flush=True)
     except Exception as e:
