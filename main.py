@@ -1,32 +1,34 @@
 import os
 import time
+import signal
+import sys
 import threading
 import asyncio
 import cv2
 import face_recognition
 import numpy as np
 
-# Import the async say() function from voice.py in the same folder
 from voice import say
-from extend_actuator import extend
-from retract_actuator import retract
+from actuator_control import extend, retract, stop_actuator, cleanup_gpio
 
 # --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FACES_DIR = os.path.join(BASE_DIR, "faces")
-CAMERA_INDEX = 0           # Default USB webcam
-ACTUATOR_DURATION = 30     # Seconds to extend/retract
-OPEN_DELAY = 5             # Seconds to wait before closing
-MIN_AUTHORITY = 2          # Minimum authority level required to open the door
-PROCESS_EVERY_N_FRAMES = 4 # Process 1 out of N frames to keep RPi 5 CPU cool
-DISPLAY_VIDEO = False      # MUST be False when running as a background systemd service
-
-# Debounce interval in seconds (prevents repeating speech on consecutive frames)
+CAMERA_INDEX = 0
+ACTUATOR_DURATION = 30
+OPEN_DELAY = 5
+MIN_AUTHORITY = 2
+PROCESS_EVERY_N_FRAMES = 4
+DISPLAY_VIDEO = False
 TTS_COOLDOWN = 6.0
 
-# Locks and state flags
+# Shutdown coordinator
+stop_event = threading.Event()
+
+# Locks and tracking
 door_lock = threading.Lock()
 is_door_busy = False
+current_door_thread = None
 
 tts_lock = threading.Lock()
 is_speaking = False
@@ -36,12 +38,10 @@ last_speech_time = 0.0
 # --- Vietnamese Text-to-Speech Functions ---
 
 def _play_tts_worker(text):
-    """
-    Worker function to execute the async say() function from voice.py
-    inside an isolated event loop on a background thread.
-    """
     global is_speaking, last_speech_time
     try:
+        if stop_event.is_set():
+            return
         asyncio.run(say(text))
     except Exception as e:
         print(f"[TTS ERROR] Failed to speak '{text}': {e}", flush=True)
@@ -52,10 +52,10 @@ def _play_tts_worker(text):
 
 
 def speak_vn_async(text, force=False):
-    """
-    Non-blocking TTS trigger with cooldown to avoid spamming the audio device.
-    """
     global is_speaking, last_speech_time
+    if stop_event.is_set():
+        return
+
     with tts_lock:
         now = time.time()
         if is_speaking:
@@ -92,13 +92,11 @@ def load_known_faces(directory):
                 name, auth_str = parts
                 photo_num = "1"
             else:
-                print(f"[SKIP] '{filename}' does not match '<name>_<authority_level>_<photo_number>'.")
                 continue
 
             try:
                 authority = int(auth_str)
             except ValueError:
-                print(f"[SKIP] Invalid authority level '{auth_str}' in '{filename}'. Must be an integer.")
                 continue
 
             filepath = os.path.join(directory, filename)
@@ -110,57 +108,75 @@ def load_known_faces(directory):
                 known_names.append(name)
                 known_authorities.append(authority)
                 print(f"  -> Loaded: {name} | Authority: {authority} | Photo #{photo_num}")
-            else:
-                print(f"[WARN] No face detected in '{filename}'. Skipping.")
 
     return known_encodings, known_names, known_authorities
 
 
 def operate_door(person_name, authority):
     """
-    Executes door cycle in background thread and triggers welcome greeting.
+    Runs the door cycle with responsive stop_event checks at every stage.
     """
     global is_door_busy
     try:
         print(f"\n[ACCESS GRANTED] Welcome {person_name} (Authority: {authority}).", flush=True)
-
-        # Trigger welcome voice in Vietnamese
         speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
 
-        print(f"[DOOR] Opening door for {ACTUATOR_DURATION} seconds...", flush=True)
-        retract(duration=ACTUATOR_DURATION)
+        print(f"[DOOR] Opening door for {ACTUATOR_DURATION}s...", flush=True)
+        retract(duration=ACTUATOR_DURATION, stop_event=stop_event)
 
-        print(f"[DOOR] Door fully open. Waiting {OPEN_DELAY} seconds...", flush=True)
-        time.sleep(OPEN_DELAY)
+        if stop_event.is_set():
+            return
 
-        print(f"[DOOR] Closing door for {ACTUATOR_DURATION} seconds...", flush=True)
-        extend(duration=ACTUATOR_DURATION)
+        print(f"[DOOR] Door open. Waiting {OPEN_DELAY}s...", flush=True)
+        stop_event.wait(timeout=OPEN_DELAY)
 
-        print("[DOOR] Door cycle complete. Ready for next scan.\n", flush=True)
+        if stop_event.is_set():
+            return
+
+        print(f"[DOOR] Closing door for {ACTUATOR_DURATION}s...", flush=True)
+        extend(duration=ACTUATOR_DURATION, stop_event=stop_event)
+
+        if not stop_event.is_set():
+            print("[DOOR] Door cycle complete.\n", flush=True)
     except Exception as e:
-        print(f"[ERROR] Door operation encountered an error: {e}", flush=True)
+        print(f"[ERROR] Door operation error: {e}", flush=True)
     finally:
+        stop_actuator()
         with door_lock:
             is_door_busy = False
 
 
 def trigger_door_async(person_name, authority):
-    global is_door_busy
+    global is_door_busy, current_door_thread
     with door_lock:
-        if is_door_busy:
+        if is_door_busy or stop_event.is_set():
             return
         is_door_busy = True
 
-    door_thread = threading.Thread(
+    current_door_thread = threading.Thread(
         target=operate_door, 
         args=(person_name, authority), 
         daemon=True
     )
-    door_thread.start()
+    current_door_thread.start()
+
+
+def shutdown(signum=None, frame=None):
+    """Coordinated shutdown routine."""
+    print("\n[INFO] Shutdown signal received. Halting hardware...", flush=True)
+    stop_event.set()
+    stop_actuator()
+    cleanup_gpio()
+    if signum is not None:
+        sys.exit(0)
 
 
 def main():
-    known_encodings, known_names, known_authorities = load_known_faces(FACES_DIR)
+    # Trap SIGINT (Ctrl+C) and SIGTERM (systemctl stop / kill)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    known_encodings, known_names, known_authorities = load_faces = load_known_faces(FACES_DIR)
     if not known_encodings:
         print("[ERROR] No valid faces loaded. Exiting.", flush=True)
         return
@@ -171,26 +187,20 @@ def main():
     video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not video_capture.isOpened():
-        print("[ERROR] Could not open USB webcam. Check connection and CAMERA_INDEX.", flush=True)
+        print("[ERROR] Could not open USB webcam.", flush=True)
         return
 
-    print("[INFO] System running and monitoring webcam feed...", flush=True)
-
+    print("[INFO] System active. Press Ctrl+C to safely exit.", flush=True)
     frame_count = 0
-    face_locations = []
-    face_labels = []
-    face_colors = []
 
     try:
-        while True:
+        while not stop_event.is_set():
             ret, frame = video_capture.read()
             if not ret:
-                print("[WARN] Failed to grab frame from webcam. Retrying...", flush=True)
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
 
             frame_count += 1
-
             if frame_count % PROCESS_EVERY_N_FRAMES == 0:
                 small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -198,14 +208,10 @@ def main():
                 face_locations = face_recognition.face_locations(rgb_small_frame)
                 face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-                face_labels = []
-                face_colors = []
-
                 for face_encoding in face_encodings:
                     matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.5)
                     name = "Unknown"
                     authority = 0
-                    color = (0, 0, 255)
 
                     face_distances = face_recognition.face_distance(known_encodings, face_encoding)
                     if len(face_distances) > 0:
@@ -214,48 +220,23 @@ def main():
                             name = known_names[best_match_index]
                             authority = known_authorities[best_match_index]
 
-                    # Decision logic for authority & voice
                     if name != "Unknown" and authority >= MIN_AUTHORITY:
-                        color = (0, 255, 0)
                         trigger_door_async(name, authority)
                     else:
-                        # Triggers for either Unknown faces or known faces with authority < MIN_AUTHORITY
                         if not is_door_busy:
-                            if name == "Unknown":
-                                print("[ACCESS DENIED] Unknown person detected.", flush=True)
-                            else:
-                                print(f"[ACCESS DENIED] {name} (Authority {authority} < {MIN_AUTHORITY})", flush=True)
-                            
                             speak_vn_async("cút ra ngoài")
 
-                    label = f"{name} (Lvl {authority})" if name != "Unknown" else "Unknown"
-                    face_labels.append(label)
-                    face_colors.append(color)
-
             if DISPLAY_VIDEO:
-                for (top, right, bottom, left), label, color in zip(face_locations, face_labels, face_colors):
-                    top *= 4
-                    right *= 4
-                    bottom *= 4
-                    left *= 4
-
-                    cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.rectangle(frame, (left, bottom - 30), (right, bottom), color, cv2.FILLED)
-                    cv2.putText(frame, label, (left + 6, bottom - 8), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
-
-                if is_door_busy:
-                    cv2.putText(frame, "DOOR OPERATING...", (15, 35), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 2)
-
                 cv2.imshow("RPi5 Face Access Control", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-    except KeyboardInterrupt:
-        print("\n[INFO] Shutting down face recognition...", flush=True)
     finally:
+        shutdown()
         video_capture.release()
         if DISPLAY_VIDEO:
             cv2.destroyAllWindows()
+        print("[INFO] Clean exit complete.", flush=True)
 
 
 if __name__ == "__main__":

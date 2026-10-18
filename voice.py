@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import subprocess
 
 MODEL_PATH = "vi_VN-vivos-x_low.onnx"
@@ -53,3 +54,15 @@ async def say(text: str, model_path: str = MODEL_PATH) -> None:
 
     # Stream the data between processes and wait for completion
     await asyncio.gather(pipe_audio(), piper_proc.wait(), aplay_proc.wait())
+
+if __name__ == "__main__":
+    # Allows passing custom text via CLI: python voice.py "Xin chào"
+    # Otherwise falls back to a default test phrase
+    test_phrase = sys.argv[1] if len(sys.argv) > 1 else "Kiểm tra hệ thống âm thanh tiếng Việt thành công."
+    print(f"[TEST] Phát âm thanh: \"{test_phrase}\"")
+    
+    try:
+        asyncio.run(say(test_phrase))
+        print("[TEST] Hoàn thành.")
+    except KeyboardInterrupt:
+        print("\n[TEST] Đã dừng phát âm thanh.")
