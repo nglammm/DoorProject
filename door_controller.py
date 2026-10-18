@@ -37,8 +37,8 @@ VOICE_SIMILARITY_THRESHOLD = 0.76  # Adjust between 0.72 (lenient) and 0.80 (str
 MIN_SPEECH_SECONDS = 0.8  # Minimum active speech length to verify speaker
 
 # Voice Command Phrases (supports common Vosk misrecognitions too)
-OPEN_COMMANDS = ("open door", "open the door")
-CLOSE_COMMANDS = ("close door", "close the door", "closed door")
+OPEN_COMMANDS = ("open door", "open the door", "open")
+CLOSE_COMMANDS = ("close door", "close the door", "closed door", "close")
 
 # Suppress Vosk log spam
 SetLogLevel(-1)
