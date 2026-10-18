@@ -1,68 +1,40 @@
-import asyncio
 import sys
-import subprocess
+import asyncio
+import edge_tts
 
-MODEL_PATH = "vi_VN-vivos-x_low.onnx"
+# High-quality neural Vietnamese male voice
+VOICE_NAME = "vi-VN-NamMinhNeural"
 
-async def say(text: str, model_path: str = MODEL_PATH) -> None:
+async def say(text: str, voice: str = VOICE_NAME) -> None:
     """
-    Synthesizes Vietnamese text offline with Piper and pipes raw audio to aplay.
+    Streams high-quality neural Vietnamese audio directly from Edge TTS to aplay.
     """
-    # 1. Start piper process
-    piper_proc = await asyncio.create_subprocess_exec(
-        "piper",
-        "--model", model_path,
-        "--output-raw",
+    communicate = edge_tts.Communicate(text, voice)
+
+    # Launch aplay expecting MP3/decoded audio, or pipe into mpv
+    proc = await asyncio.create_subprocess_exec(
+        "mpv",
+        "--no-terminal",
+        "--really-quiet",
+        "-",
         stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
     )
 
-    # 2. Start aplay process reading from PIPE
-    aplay_proc = await asyncio.create_subprocess_exec(
-        "aplay",
-        "-r", "22050",
-        "-f", "S16_LE",
-        "-t", "raw",
-        "-q",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-
-    async def pipe_audio():
-        # Read from Piper's stdout stream and write into aplay's stdin stream
-        try:
-            while True:
-                chunk = await piper_proc.stdout.read(4096)
-                if not chunk:
-                    break
-                if aplay_proc.stdin:
-                    aplay_proc.stdin.write(chunk)
-                    await aplay_proc.stdin.drain()
-        finally:
-            if aplay_proc.stdin:
-                aplay_proc.stdin.close()
-                await aplay_proc.stdin.wait_closed()
-
-    # Feed input text to Piper
-    if piper_proc.stdin:
-        piper_proc.stdin.write(text.encode("utf-8"))
-        await piper_proc.stdin.drain()
-        piper_proc.stdin.close()
-        await piper_proc.stdin.wait_closed()
-
-    # Stream the data between processes and wait for completion
-    await asyncio.gather(pipe_audio(), piper_proc.wait(), aplay_proc.wait())
+    try:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio" and proc.stdin:
+                proc.stdin.write(chunk["data"])
+                await proc.stdin.drain()
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+        await proc.wait()
 
 if __name__ == "__main__":
-    # Allows passing custom text via CLI: python voice.py "Xin chào"
-    # Otherwise falls back to a default test phrase
-    test_phrase = sys.argv[1] if len(sys.argv) > 1 else "Kiểm tra hệ thống âm thanh tiếng Việt thành công."
-    print(f"[TEST] Phát âm thanh: \"{test_phrase}\"")
-    
+    test_phrase = sys.argv[1] if len(sys.argv) > 1 else "Xin chào, hệ thống nhận diện khuôn mặt đã sẵn sàng hoạt động."
+    print(f"[TEST] Phát âm thanh giọng nam (Edge-TTS): \"{test_phrase}\"")
     try:
         asyncio.run(say(test_phrase))
-        print("[TEST] Hoàn thành.")
     except KeyboardInterrupt:
-        print("\n[TEST] Đã dừng phát âm thanh.")
+        print("\n[TEST] Dừng phát âm.")
