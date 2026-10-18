@@ -2,3 +2,6 @@ face_recognition
 numpy
 opencv-python
 edge-tts
+sounddevice
+vosk
+resemblyzer
