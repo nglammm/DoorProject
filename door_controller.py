@@ -33,8 +33,8 @@ TTS_COOLDOWN = 6.0
 # Voice Configuration
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4000  # 0.25s audio chunks
-VOICE_SIMILARITY_THRESHOLD = 0.76  # Adjust between 0.72 (lenient) and 0.80 (strict)
-MIN_SPEECH_SECONDS = 0.8  # Minimum active speech length to verify speaker
+VOICE_SIMILARITY_THRESHOLD = 0.7  # Adjust between 0.72 (lenient) and 0.80 (strict)
+MIN_SPEECH_SECONDS = 0.2  # Minimum active speech length to verify speaker
 
 # Voice Command Phrases (supports common Vosk misrecognitions too)
 OPEN_COMMANDS = ("open door", "open the door", "open")
