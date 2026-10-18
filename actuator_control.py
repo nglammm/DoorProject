@@ -1,5 +1,7 @@
 # actuator_control.py
 import time
+import argparse
+import threading
 import RPi.GPIO as GPIO
 
 RELAY_1 = 23
@@ -42,13 +44,16 @@ def extend(duration=None, stop_event=None):
 
         if duration is not None:
             if stop_event:
-                # Returns True early if stop_event is triggered
                 stop_event.wait(timeout=duration)
             else:
                 time.sleep(duration)
         else:
-            while stop_event and not stop_event.is_set():
-                time.sleep(0.1)
+            if stop_event:
+                while not stop_event.is_set():
+                    time.sleep(0.1)
+            else:
+                while True:
+                    time.sleep(0.1)
     finally:
         stop_actuator()
 
@@ -70,7 +75,57 @@ def retract(duration=None, stop_event=None):
             else:
                 time.sleep(duration)
         else:
-            while stop_event and not stop_event.is_set():
-                time.sleep(0.1)
+            if stop_event:
+                while not stop_event.is_set():
+                    time.sleep(0.1)
+            else:
+                while True:
+                    time.sleep(0.1)
     finally:
         stop_actuator()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Manual linear actuator controller for Raspberry Pi."
+    )
+    
+    # Mutually exclusive group: user must choose extend OR retract
+    action_group = parser.add_mutually_exclusive_group(required=True)
+    action_group.add_argument(
+        "--extend", "-extend", "-e",
+        action="store_true",
+        help="Extend the actuator"
+    )
+    action_group.add_argument(
+        "--retract", "-retract", "-r",
+        action="store_true",
+        help="Retract the actuator"
+    )
+
+    # Optional duration parameter
+    parser.add_argument(
+        "--duration", "-duration", "-d",
+        type=float,
+        default=None,
+        help="Run duration in seconds as a float (e.g. 5.5). If omitted, runs indefinitely until Ctrl+C."
+    )
+
+    args = parser.parse_args()
+    cli_stop_event = threading.Event()
+
+    action_label = "Extending" if args.extend else "Retracting"
+    duration_label = f"for {args.duration:.2f}s" if args.duration is not None else "indefinitely (Press Ctrl+C to halt)"
+    print(f"[ACTUATOR] {action_label} {duration_label}...", flush=True)
+
+    try:
+        if args.extend:
+            extend(duration=args.duration, stop_event=cli_stop_event)
+        elif args.retract:
+            retract(duration=args.duration, stop_event=cli_stop_event)
+    except KeyboardInterrupt:
+        print("\n[STOP] Received Ctrl+C. Halting actuator immediately...", flush=True)
+        cli_stop_event.set()
+    finally:
+        cleanup_gpio()
+        print("[CLEANUP] Actuator stopped and GPIO released.", flush=True)
