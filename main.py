@@ -1,20 +1,19 @@
 import os
 import time
 import threading
-import hashlib
+import asyncio
 import cv2
 import face_recognition
 import numpy as np
-from gtts import gTTS
-import pygame
 
+# Import the async say() function from voice.py in the same folder
+from voice import say
 from extend_actuator import extend
 from retract_actuator import retract
 
 # --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FACES_DIR = os.path.join(BASE_DIR, "faces")
-TTS_CACHE_DIR = os.path.join(BASE_DIR, "tts_cache")
 CAMERA_INDEX = 0           # Default USB webcam
 ACTUATOR_DURATION = 30     # Seconds to extend/retract
 OPEN_DELAY = 5             # Seconds to wait before closing
@@ -24,11 +23,6 @@ DISPLAY_VIDEO = False      # MUST be False when running as a background systemd 
 
 # Debounce interval in seconds (prevents repeating speech on consecutive frames)
 TTS_COOLDOWN = 6.0
-
-# Initialize Pygame Mixer for non-blocking playback
-pygame.mixer.init()
-if not os.path.exists(TTS_CACHE_DIR):
-    os.makedirs(TTS_CACHE_DIR)
 
 # Locks and state flags
 door_lock = threading.Lock()
@@ -43,25 +37,12 @@ last_speech_time = 0.0
 
 def _play_tts_worker(text):
     """
-    Worker function to fetch/cache MP3 and play via pygame mixer.
+    Worker function to execute the async say() function from voice.py
+    inside an isolated event loop on a background thread.
     """
     global is_speaking, last_speech_time
     try:
-        # Cache file based on MD5 of text to avoid re-downloading on every scan
-        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-        cache_path = os.path.join(TTS_CACHE_DIR, f"{text_hash}.mp3")
-
-        if not os.path.exists(cache_path):
-            tts = gTTS(text=text, lang='vi')
-            tts.save(cache_path)
-
-        pygame.mixer.music.load(cache_path)
-        pygame.mixer.music.play()
-
-        # Wait until playback finishes before releasing the lock
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-
+        asyncio.run(say(text))
     except Exception as e:
         print(f"[TTS ERROR] Failed to speak '{text}': {e}", flush=True)
     finally:
