@@ -36,11 +36,16 @@ BLOCK_SIZE = 4000  # 0.25s audio chunks
 VOICE_SIMILARITY_THRESHOLD = 0.76  # Adjust between 0.72 (lenient) and 0.80 (strict)
 MIN_SPEECH_SECONDS = 0.8  # Minimum active speech length to verify speaker
 
+# Voice Command Phrases (supports common Vosk misrecognitions too)
+OPEN_COMMANDS = ("open door", "open the door")
+CLOSE_COMMANDS = ("close door", "close the door", "closed door")
+
 # Suppress Vosk log spam
 SetLogLevel(-1)
 
-# Shutdown coordinator
+# Shutdown & Door Preemption Coordinators
 stop_event = threading.Event()
+door_abort_event = threading.Event()
 
 # Locks and tracking
 door_lock = threading.Lock()
@@ -50,6 +55,26 @@ current_door_thread = None
 tts_lock = threading.Lock()
 is_speaking = False
 last_speech_time = 0.0
+
+
+class CompositeEvent:
+    """
+    Combines the global stop_event and the per-command door_abort_event
+    so retract() and extend() wake up and stop immediately if EITHER is triggered.
+    """
+    def __init__(self, *events):
+        self.events = events
+
+    def is_set(self):
+        return any(e.is_set() for e in self.events)
+
+    def wait(self, timeout=None):
+        start = time.time()
+        while not self.is_set():
+            if timeout is not None and (time.time() - start) >= timeout:
+                return False
+            time.sleep(0.05)
+        return True
 
 
 # --- Vietnamese Text-to-Speech Functions ---
@@ -75,7 +100,7 @@ def speak_vn_async(text, force=False):
 
     with tts_lock:
         now = time.time()
-        if is_speaking:
+        if is_speaking and not force:
             return
         if not force and (now - last_speech_time) < TTS_COOLDOWN:
             return
@@ -130,10 +155,6 @@ def load_known_faces(directory):
 
 
 def load_known_voices(directory):
-    """
-    Loads '<name>_<authority>.npy' (or legacy '<name>.npy' with default authority 2)
-    from enrolled_voices/.
-    """
     voice_profiles = []
     if not os.path.exists(directory):
         os.makedirs(directory)
@@ -151,7 +172,7 @@ def load_known_voices(directory):
                 authority = int(parts[1])
             else:
                 name = base_name
-                authority = MIN_AUTHORITY  # Fallback for legacy '<name>.npy' files
+                authority = MIN_AUTHORITY
 
             filepath = os.path.join(directory, filename)
             embedding = np.load(filepath)
@@ -165,32 +186,62 @@ def load_known_voices(directory):
     return voice_profiles
 
 
-# --- Door Control ---
+# --- Door Control (Supports Normal Cycle + Force Open / Force Close) ---
 
-def operate_door(person_name, authority, source="Biometric"):
-    """Runs the door cycle with responsive stop_event checks at every stage."""
+def operate_door(person_name, authority, source="Biometric", action="cycle"):
+    """
+    action can be:
+      - 'cycle'       : Normal open -> wait -> close
+      - 'force_open'  : Immediately open door and stay open
+      - 'force_close' : Immediately close door and stay closed
+    """
     global is_door_busy
+    active_event = CompositeEvent(stop_event, door_abort_event)
+
     try:
-        print(f"\n[ACCESS GRANTED via {source}] Welcome {person_name} (Authority: {authority}).", flush=True)
-        speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
+        if action == "force_open":
+            print(f"\n[FORCE OPEN via {source}] {person_name} (Authority: {authority}) ordered OPEN DOOR!", flush=True)
+            speak_vn_async(f"Đang mở cửa theo lệnh của {person_name}", force=True)
 
-        print(f"[DOOR] Opening door for {ACTUATOR_DURATION}s...", flush=True)
-        retract(duration=ACTUATOR_DURATION, stop_event=stop_event)
+            print(f"[DOOR] Force-opening door for {ACTUATOR_DURATION}s...", flush=True)
+            retract(duration=ACTUATOR_DURATION, stop_event=active_event)
 
-        if stop_event.is_set():
-            return
+            if not active_event.is_set():
+                print("[DOOR] Force-open complete. Door remains open.\n", flush=True)
 
-        print(f"[DOOR] Door open. Waiting {OPEN_DELAY}s...", flush=True)
-        stop_event.wait(timeout=OPEN_DELAY)
+        elif action == "force_close":
+            print(f"\n[FORCE CLOSE via {source}] {person_name} (Authority: {authority}) ordered CLOSE DOOR!", flush=True)
+            speak_vn_async(f"Đang đóng cửa theo lệnh của {person_name}", force=True)
 
-        if stop_event.is_set():
-            return
+            print(f"[DOOR] Force-closing door for {ACTUATOR_DURATION}s...", flush=True)
+            extend(duration=ACTUATOR_DURATION, stop_event=active_event)
 
-        print(f"[DOOR] Closing door for {ACTUATOR_DURATION}s...", flush=True)
-        extend(duration=ACTUATOR_DURATION, stop_event=stop_event)
+            if not active_event.is_set():
+                print("[DOOR] Force-close complete. Door remains closed.\n", flush=True)
 
-        if not stop_event.is_set():
-            print("[DOOR] Door cycle complete.\n", flush=True)
+        else:
+            # Standard automatic cycle
+            print(f"\n[ACCESS GRANTED via {source}] Welcome {person_name} (Authority: {authority}).", flush=True)
+            speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
+
+            print(f"[DOOR] Opening door for {ACTUATOR_DURATION}s...", flush=True)
+            retract(duration=ACTUATOR_DURATION, stop_event=active_event)
+
+            if active_event.is_set():
+                return
+
+            print(f"[DOOR] Door open. Waiting {OPEN_DELAY}s...", flush=True)
+            active_event.wait(timeout=OPEN_DELAY)
+
+            if active_event.is_set():
+                return
+
+            print(f"[DOOR] Closing door for {ACTUATOR_DURATION}s...", flush=True)
+            extend(duration=ACTUATOR_DURATION, stop_event=active_event)
+
+            if not active_event.is_set():
+                print("[DOOR] Door cycle complete.\n", flush=True)
+
     except Exception as e:
         print(f"[ERROR] Door operation error: {e}", flush=True)
     finally:
@@ -199,19 +250,50 @@ def operate_door(person_name, authority, source="Biometric"):
             is_door_busy = False
 
 
-def trigger_door_async(person_name, authority, source="Biometric"):
+def trigger_door_async(person_name, authority, source="Biometric", action="cycle", force=False):
+    """
+    Starts a door operation. If force=True and the door is currently moving/waiting,
+    it immediately aborts the running door thread and executes the new action.
+    """
     global is_door_busy, current_door_thread
-    with door_lock:
-        if is_door_busy or stop_event.is_set():
-            return
-        is_door_busy = True
 
-    current_door_thread = threading.Thread(
-        target=operate_door,
-        args=(person_name, authority, source),
-        daemon=True
-    )
-    current_door_thread.start()
+    if stop_event.is_set():
+        return
+
+    if force:
+        # Check if an existing door thread is active and preempt it
+        thread_to_wait = None
+        with door_lock:
+            if is_door_busy and current_door_thread is not None and current_door_thread.is_alive():
+                print(f"[OVERRIDE] Aborting active door task for forced command ({action})...", flush=True)
+                door_abort_event.set()
+                stop_actuator()
+                thread_to_wait = current_door_thread
+
+        if thread_to_wait is not None:
+            thread_to_wait.join(timeout=2.0)
+
+        with door_lock:
+            door_abort_event.clear()
+            is_door_busy = True
+            current_door_thread = threading.Thread(
+                target=operate_door,
+                args=(person_name, authority, source, action),
+                daemon=True
+            )
+            current_door_thread.start()
+    else:
+        with door_lock:
+            if is_door_busy:
+                return
+            door_abort_event.clear()
+            is_door_busy = True
+            current_door_thread = threading.Thread(
+                target=operate_door,
+                args=(person_name, authority, source, action),
+                daemon=True
+            )
+            current_door_thread.start()
 
 
 # --- Continuous Background Voice Recognition Thread ---
@@ -239,6 +321,16 @@ def identify_speaker(encoder, audio_int16, voice_profiles):
     if best_score >= VOICE_SIMILARITY_THRESHOLD:
         return best_name, best_auth, best_score
     return "Unknown", 0, best_score
+
+
+def parse_voice_command(text):
+    """Checks if spoken text contains a forceful open or close command."""
+    cleaned = text.lower().strip()
+    if any(cmd in cleaned for cmd in OPEN_COMMANDS):
+        return "force_open"
+    if any(cmd in cleaned for cmd in CLOSE_COMMANDS):
+        return "force_close"
+    return None
 
 
 def voice_listener_worker(voice_profiles):
@@ -278,7 +370,7 @@ def voice_listener_worker(voice_profiles):
             channels=1,
             callback=audio_callback
         ):
-            print("[VOICE] Continuous microphone listener active.", flush=True)
+            print("[VOICE] Continuous microphone listener active. Say 'open door' or 'close door'.", flush=True)
 
             while not stop_event.is_set():
                 try:
@@ -306,17 +398,34 @@ def voice_listener_worker(voice_profiles):
                         speaker, authority, confidence = identify_speaker(
                             encoder, audio_np, voice_profiles
                         )
-                        print(f"[VOICE] Heard ({speaker} | Auth {authority} | Sim {confidence:.2f}): '{text}'", flush=True)
+                        command_action = parse_voice_command(text)
+
+                        print(
+                            f"[VOICE] Heard ({speaker} | Auth {authority} | Sim {confidence:.2f}): '{text}'",
+                            flush=True
+                        )
 
                         if speaker == "Too Short":
-                            pass  # Ignore tiny coughs/noises
+                            pass
                         elif speaker != "Unknown" and authority >= MIN_AUTHORITY:
-                            trigger_door_async(speaker, authority, source="Voice")
+                            if command_action == "force_open":
+                                trigger_door_async(
+                                    speaker, authority, source="Voice Command", action="force_open", force=True
+                                )
+                            elif command_action == "force_close":
+                                trigger_door_async(
+                                    speaker, authority, source="Voice Command", action="force_close", force=True
+                                )
+                            else:
+                                # Spoken phrase without a specific command triggers standard door cycle
+                                trigger_door_async(
+                                    speaker, authority, source="Voice", action="cycle", force=False
+                                )
                         else:
                             if not is_door_busy:
                                 speak_vn_async("cút ra ngoài")
 
-                    # Re-initialize bytearray cleanly
+                    # Reset buffer cleanly for next phrase
                     current_phrase_pcm = bytearray()
                 else:
                     partial = json.loads(recognizer.PartialResult()).get("partial", "")
@@ -334,6 +443,7 @@ def shutdown(signum=None, frame=None):
     """Coordinated shutdown routine."""
     print("\n[INFO] Shutdown signal received. Halting hardware...", flush=True)
     stop_event.set()
+    door_abort_event.set()
     stop_actuator()
     cleanup_gpio()
     if signum is not None:
@@ -359,7 +469,7 @@ def main():
     )
     voice_thread.start()
 
-    # Open camera if faces are enrolled (or run voice-only if no camera/faces)
+    # Open camera if faces are enrolled
     video_capture = None
     if known_encodings:
         print("[INFO] Opening USB webcam stream...", flush=True)
@@ -377,7 +487,6 @@ def main():
     try:
         while not stop_event.is_set():
             if video_capture is None:
-                # If running voice-only, keep main thread alive waiting for stop_event
                 stop_event.wait(timeout=0.5)
                 continue
 
@@ -407,7 +516,7 @@ def main():
                             authority = known_authorities[best_match_index]
 
                     if name != "Unknown" and authority >= MIN_AUTHORITY:
-                        trigger_door_async(name, authority, source="Face")
+                        trigger_door_async(name, authority, source="Face", action="cycle", force=False)
                     else:
                         if not is_door_busy:
                             speak_vn_async("cút ra ngoài")
