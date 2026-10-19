@@ -1,40 +1,27 @@
 from time import sleep
-from gpiozero import AngularServo
+from gpiozero import AngularServo, OutputDevice
 
-# Setup parameters for DS3235 35kg Servo
-# pin=18 corresponds to BCM GPIO 18 (Physical Pin 12)
-# min_pulse_width = 0.5ms (0.0005s), max_pulse_width = 2.5ms (0.0025s)
 servo = AngularServo(
     18, min_angle=0, max_angle=180, min_pulse_width=0.5 / 1000, max_pulse_width=2.5 / 1000
 )
 
 try:
-  print("Starting AngularServo test for 35kg servo. Press Ctrl+C to exit.")
-
-  while True:
-    print("Moving to 0°")
-    servo.angle = 0
-    sleep(1.5)
-
-    print("Moving to 90° (Center)")
-    servo.angle = 90
-    sleep(1.5)
-
-    print("Moving to 180°")
-    servo.angle = 180
-    sleep(1.5)
-
-    # Smooth sweep demo using AngularServo
-    print("Sweeping smoothly...")
-    for angle in range(0, 181, 10):
-      servo.angle = angle
-      sleep(0.05)
-
-    for angle in range(180, -1, -10):
-      servo.angle = angle
-      sleep(0.05)
+    print("Starting AngularServo test. Press Ctrl+C to exit.")
+    while True:
+        #Narrow the extremes slightly first to rule out physical end-stop stalling
+        servo.angle = 10
+        sleep(1.5)
+        servo.angle = 90
+        sleep(1.5)
+        servo.angle = 170
+        sleep(1.5)
 
 except KeyboardInterrupt:
-  print("\nStopping test. Detaching servo.")
-  # Detaching sets the pulse to None, dropping the PWM signal so the servo relaxes
-  servo.detach()
+    print("\nStopping test. Detaching servo and pulling signal LOW.")
+    servo.detach()
+    sleep(0.2)  # Give the servo MCU time to register 0 pulse width
+    servo.close()  # Release the pin from AngularServo
+    
+    # Actively hold GPIO 18 LOW (0V) so it doesn't float
+    pin_killer = OutputDevice(18, initial_value=False)
+    sleep(0.5)
