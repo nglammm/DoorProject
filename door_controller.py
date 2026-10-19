@@ -6,6 +6,7 @@ import signal
 import sys
 import threading
 import asyncio
+from datetime import datetime
 import cv2
 import face_recognition
 import numpy as np
@@ -21,6 +22,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FACES_DIR = os.path.join(BASE_DIR, "faces")
 VOICES_DIR = os.path.join(BASE_DIR, "enrolled_voices")
 VOSK_MODEL_PATH = os.path.join(BASE_DIR, "model")
+SCHEDULES_FILE = os.path.join(BASE_DIR, "schedules.json")
 
 CAMERA_INDEX = 0
 ACTUATOR_DURATION = 30
@@ -36,7 +38,8 @@ BLOCK_SIZE = 4000  # 0.25s audio chunks
 VOICE_SIMILARITY_THRESHOLD = 0.7  # Adjust between 0.72 (lenient) and 0.80 (strict)
 MIN_SPEECH_SECONDS = 0.2  # Minimum active speech length to verify speaker
 
-# Voice Command Phrases (supports common Vosk misrecognitions too)
+# Voice Command Phrases
+STOP_COMMANDS = ("stop the door", "stop door", "stop", "halt", "freeze")
 OPEN_COMMANDS = ("open door", "open the door", "open")
 CLOSE_COMMANDS = ("close door", "close the door", "closed door", "close")
 
@@ -55,6 +58,12 @@ current_door_thread = None
 tts_lock = threading.Lock()
 is_speaking = False
 last_speech_time = 0.0
+
+# Guest Mode ("unlock for everyone") state
+guest_mode_lock = threading.Lock()
+guest_mode_until = 0.0
+guest_actuator_duration = ACTUATOR_DURATION
+guest_open_delay = OPEN_DELAY
 
 
 class CompositeEvent:
@@ -108,6 +117,30 @@ def speak_vn_async(text, force=False):
 
     thread = threading.Thread(target=_play_tts_worker, args=(text,), daemon=True)
     thread.start()
+
+
+# --- Guest Mode Helpers ---
+
+def activate_guest_mode(duration_sec, act_duration=None, open_wait=None):
+    """Enables 'unlock for everyone' mode for a specified duration in seconds."""
+    global guest_mode_until, guest_actuator_duration, guest_open_delay
+    with guest_mode_lock:
+        guest_mode_until = time.time() + duration_sec
+        guest_actuator_duration = act_duration if act_duration is not None else ACTUATOR_DURATION
+        guest_open_delay = open_wait if open_wait is not None else OPEN_DELAY
+    print(
+        f"[SCHEDULE] Guest Mode ACTIVE for {duration_sec}s "
+        f"(Actuator: {guest_actuator_duration}s, Wait: {guest_open_delay}s).",
+        flush=True
+    )
+
+
+def get_guest_mode_status():
+    """Returns (is_active, actuator_duration, open_delay)."""
+    with guest_mode_lock:
+        if time.time() < guest_mode_until:
+            return True, guest_actuator_duration, guest_open_delay
+        return False, ACTUATOR_DURATION, OPEN_DELAY
 
 
 # --- Profile Loaders (Faces & Voices) ---
@@ -186,58 +219,128 @@ def load_known_voices(directory):
     return voice_profiles
 
 
-# --- Door Control (Supports Normal Cycle + Force Open / Force Close) ---
+# --- Door Control (Cycle, Guest Cycle, Force Open/Close, & Immediate Stop) ---
 
-def operate_door(person_name, authority, source="Biometric", action="cycle"):
+def halt_door_immediately(person_name, authority, source="Voice Command"):
+    """Immediately stops the door actuator and aborts any active door thread."""
+    global is_door_busy
+    print(f"\n[STOP COMMAND via {source}] {person_name} (Authority: {authority}) ordered STOP DOOR!", flush=True)
+    door_abort_event.set()
+    stop_actuator()
+    speak_vn_async(f"Đã dừng cửa theo lệnh của {person_name}", force=True)
+
+
+def operate_door(
+    person_name,
+    authority,
+    source="Biometric",
+    action="cycle",
+    custom_actuator_duration=None,
+    custom_open_delay=None
+):
     """
     action can be:
-      - 'cycle'       : Normal open -> wait -> close
+      - 'cycle'       : Normal open -> wait -> close (greets by name)
+      - 'guest_cycle' : Guest open -> wait -> close (greets without name)
+      - 'timed_open'  : Scheduled open -> wait custom duration -> close
       - 'force_open'  : Immediately open door and stay open
       - 'force_close' : Immediately close door and stay closed
     """
     global is_door_busy
     active_event = CompositeEvent(stop_event, door_abort_event)
 
+    act_dur = custom_actuator_duration if custom_actuator_duration is not None else ACTUATOR_DURATION
+    wait_dur = custom_open_delay if custom_open_delay is not None else OPEN_DELAY
+
     try:
         if action == "force_open":
             print(f"\n[FORCE OPEN via {source}] {person_name} (Authority: {authority}) ordered OPEN DOOR!", flush=True)
             speak_vn_async(f"Đang mở cửa theo lệnh của {person_name}", force=True)
 
-            print(f"[DOOR] Force-opening door for {ACTUATOR_DURATION}s...", flush=True)
-            retract(duration=ACTUATOR_DURATION, stop_event=active_event)
+            print(f"[DOOR] Force-opening door for {act_dur}s...", flush=True)
+            retract(duration=act_dur, stop_event=active_event)
 
             if not active_event.is_set():
                 print("[DOOR] Force-open complete. Door remains open.\n", flush=True)
+            else:
+                print("[DOOR] Force-open halted mid-operation.\n", flush=True)
 
         elif action == "force_close":
             print(f"\n[FORCE CLOSE via {source}] {person_name} (Authority: {authority}) ordered CLOSE DOOR!", flush=True)
             speak_vn_async(f"Đang đóng cửa theo lệnh của {person_name}", force=True)
 
-            print(f"[DOOR] Force-closing door for {ACTUATOR_DURATION}s...", flush=True)
-            extend(duration=ACTUATOR_DURATION, stop_event=active_event)
+            print(f"[DOOR] Force-closing door for {act_dur}s...", flush=True)
+            extend(duration=act_dur, stop_event=active_event)
 
             if not active_event.is_set():
                 print("[DOOR] Force-close complete. Door remains closed.\n", flush=True)
+            else:
+                print("[DOOR] Force-close halted mid-operation.\n", flush=True)
+
+        elif action == "guest_cycle":
+            print(f"\n[GUEST ACCESS via {source}] Welcoming visitor (No name).", flush=True)
+            speak_vn_async("Xin chào quý khách, mời vào", force=True)
+
+            print(f"[DOOR] Opening door for {act_dur}s...", flush=True)
+            retract(duration=act_dur, stop_event=active_event)
+
+            if active_event.is_set():
+                print("[DOOR] Guest door cycle halted.\n", flush=True)
+                return
+
+            print(f"[DOOR] Door open. Waiting {wait_dur}s...", flush=True)
+            active_event.wait(timeout=wait_dur)
+
+            if active_event.is_set():
+                print("[DOOR] Guest door cycle halted during wait.\n", flush=True)
+                return
+
+            print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
+            extend(duration=act_dur, stop_event=active_event)
+
+            if not active_event.is_set():
+                print("[DOOR] Guest door cycle complete.\n", flush=True)
+
+        elif action == "timed_open":
+            print(f"\n[SCHEDULED OPEN] Opening door for {act_dur}s, holding {wait_dur}s...", flush=True)
+            speak_vn_async("Đang mở cửa theo lịch trình", force=True)
+
+            retract(duration=act_dur, stop_event=active_event)
+            if active_event.is_set():
+                return
+
+            print(f"[DOOR] Holding door open for {wait_dur}s...", flush=True)
+            active_event.wait(timeout=wait_dur)
+            if active_event.is_set():
+                return
+
+            print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
+            extend(duration=act_dur, stop_event=active_event)
+
+            if not active_event.is_set():
+                print("[DOOR] Scheduled door cycle complete.\n", flush=True)
 
         else:
             # Standard automatic cycle
             print(f"\n[ACCESS GRANTED via {source}] Welcome {person_name} (Authority: {authority}).", flush=True)
             speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
 
-            print(f"[DOOR] Opening door for {ACTUATOR_DURATION}s...", flush=True)
-            retract(duration=ACTUATOR_DURATION, stop_event=active_event)
+            print(f"[DOOR] Opening door for {act_dur}s...", flush=True)
+            retract(duration=act_dur, stop_event=active_event)
 
             if active_event.is_set():
+                print("[DOOR] Door cycle halted.\n", flush=True)
                 return
 
-            print(f"[DOOR] Door open. Waiting {OPEN_DELAY}s...", flush=True)
-            active_event.wait(timeout=OPEN_DELAY)
+            print(f"[DOOR] Door open. Waiting {wait_dur}s...", flush=True)
+            active_event.wait(timeout=wait_dur)
 
             if active_event.is_set():
+                print("[DOOR] Door cycle halted during wait.\n", flush=True)
                 return
 
-            print(f"[DOOR] Closing door for {ACTUATOR_DURATION}s...", flush=True)
-            extend(duration=ACTUATOR_DURATION, stop_event=active_event)
+            print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
+            extend(duration=act_dur, stop_event=active_event)
 
             if not active_event.is_set():
                 print("[DOOR] Door cycle complete.\n", flush=True)
@@ -250,7 +353,15 @@ def operate_door(person_name, authority, source="Biometric", action="cycle"):
             is_door_busy = False
 
 
-def trigger_door_async(person_name, authority, source="Biometric", action="cycle", force=False):
+def trigger_door_async(
+    person_name,
+    authority,
+    source="Biometric",
+    action="cycle",
+    force=False,
+    custom_actuator_duration=None,
+    custom_open_delay=None
+):
     """
     Starts a door operation. If force=True and the door is currently moving/waiting,
     it immediately aborts the running door thread and executes the new action.
@@ -260,8 +371,11 @@ def trigger_door_async(person_name, authority, source="Biometric", action="cycle
     if stop_event.is_set():
         return
 
+    if action == "stop":
+        halt_door_immediately(person_name, authority, source)
+        return
+
     if force:
-        # Check if an existing door thread is active and preempt it
         thread_to_wait = None
         with door_lock:
             if is_door_busy and current_door_thread is not None and current_door_thread.is_alive():
@@ -278,7 +392,7 @@ def trigger_door_async(person_name, authority, source="Biometric", action="cycle
             is_door_busy = True
             current_door_thread = threading.Thread(
                 target=operate_door,
-                args=(person_name, authority, source, action),
+                args=(person_name, authority, source, action, custom_actuator_duration, custom_open_delay),
                 daemon=True
             )
             current_door_thread.start()
@@ -290,10 +404,160 @@ def trigger_door_async(person_name, authority, source="Biometric", action="cycle
             is_door_busy = True
             current_door_thread = threading.Thread(
                 target=operate_door,
-                args=(person_name, authority, source, action),
+                args=(person_name, authority, source, action, custom_actuator_duration, custom_open_delay),
                 daemon=True
             )
             current_door_thread.start()
+
+
+# --- Schedule System Worker ---
+
+DEFAULT_SCHEDULES = [
+    {
+        "name": "Morning Announcement",
+        "days": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+        "time": "07:30",
+        "action": "say",
+        "text": "Chào buổi sáng, chúc một ngày tốt lành"
+    },
+    {
+        "name": "Party Guest Access (Unlock for Everyone)",
+        "date": "2026-10-25",
+        "days": [],
+        "time": "18:00",
+        "action": "unlock_for_everyone",
+        "duration": 3600,
+        "actuator_duration": 20,
+        "open_delay": 8,
+        "text": "Chế độ đón khách đã bật, cửa mở tự động cho mọi người"
+    },
+    {
+        "name": "Scheduled Ventilation Open/Close",
+        "days": ["Sat", "Sun"],
+        "time": "08:00",
+        "action": "open_for_duration",
+        "duration": 60,
+        "actuator_duration": 15
+    }
+]
+
+
+def load_schedules(filepath):
+    """Loads schedules from JSON, creating a sample file if it doesn't exist."""
+    if not os.path.exists(filepath):
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_SCHEDULES, f, ensure_ascii=False, indent=4)
+            print(f"[SCHEDULE] Created default schedule file at '{filepath}'.", flush=True)
+        except Exception as e:
+            print(f"[SCHEDULE ERROR] Could not create '{filepath}': {e}", flush=True)
+            return DEFAULT_SCHEDULES
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[SCHEDULE ERROR] Failed to read '{filepath}': {e}", flush=True)
+        return []
+
+
+def schedule_worker():
+    """
+    Background thread that checks schedules every second.
+    Reloads schedules.json automatically if the file is modified.
+    """
+    print("[SCHEDULE] Scheduler thread started.", flush=True)
+    triggered_keys = set()
+    schedules = []
+    last_mtime = 0.0
+
+    while not stop_event.is_set():
+        # Auto-reload schedules.json if modified on disk
+        try:
+            if os.path.exists(SCHEDULES_FILE):
+                mtime = os.path.getmtime(SCHEDULES_FILE)
+                if mtime != last_mtime:
+                    schedules = load_schedules(SCHEDULES_FILE)
+                    last_mtime = mtime
+                    print(f"[SCHEDULE] Loaded {len(schedules)} schedule entries.", flush=True)
+            else:
+                schedules = load_schedules(SCHEDULES_FILE)
+                last_mtime = os.path.getmtime(SCHEDULES_FILE) if os.path.exists(SCHEDULES_FILE) else 0.0
+        except Exception as e:
+            print(f"[SCHEDULE ERROR] Watching schedule file failed: {e}", flush=True)
+
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")       # e.g., "2026-10-19"
+        current_day = now.strftime("%a")              # e.g., "Mon", "Tue"
+        current_day_full = now.strftime("%A")         # e.g., "Monday"
+        current_time = now.strftime("%H:%M")          # e.g., "16:54"
+
+        for idx, item in enumerate(schedules):
+            sched_time = item.get("time", "")
+            if sched_time != current_time:
+                continue
+
+            # Unique key ensures each schedule triggers only once per matching minute
+            trigger_key = f"{idx}_{current_date}_{current_time}"
+            if trigger_key in triggered_keys:
+                continue
+
+            # Match Date or Day of Week
+            sched_date = item.get("date", "").strip()
+            sched_days = [d.strip().lower() for d in item.get("days", [])]
+
+            date_matches = (sched_date == current_date) if sched_date else False
+            day_matches = (
+                "*" in sched_days
+                or "all" in sched_days
+                or "everyday" in sched_days
+                or current_day.lower() in sched_days
+                or current_day_full.lower() in sched_days
+            )
+
+            # Trigger if specific date matches OR (no specific date set and day matches) OR both match
+            if (sched_date and date_matches) or (not sched_date and day_matches):
+                triggered_keys.add(trigger_key)
+                name = item.get("name", f"Schedule #{idx + 1}")
+                action = item.get("action", "say").lower()
+                text = item.get("text", "")
+                duration = float(item.get("duration", OPEN_DELAY))
+                act_dur = float(item.get("actuator_duration", ACTUATOR_DURATION))
+                open_wait = float(item.get("open_delay", OPEN_DELAY))
+
+                print(f"\n[SCHEDULE TRIGGERED] '{name}' -> Action: {action}", flush=True)
+
+                if action == "say":
+                    if text:
+                        speak_vn_async(text, force=True)
+
+                elif action == "unlock_for_everyone":
+                    if text:
+                        speak_vn_async(text, force=True)
+                    activate_guest_mode(
+                        duration_sec=duration,
+                        act_duration=act_dur,
+                        open_wait=open_wait
+                    )
+
+                elif action == "open_for_duration":
+                    if text:
+                        speak_vn_async(text, force=True)
+                    trigger_door_async(
+                        person_name="Schedule",
+                        authority=999,
+                        source=f"Schedule ({name})",
+                        action="timed_open",
+                        force=True,
+                        custom_actuator_duration=act_dur,
+                        custom_open_delay=duration
+                    )
+
+        # Clean up old trigger keys to prevent set growth
+        if len(triggered_keys) > 500:
+            triggered_keys.clear()
+
+        stop_event.wait(timeout=1.0)
 
 
 # --- Continuous Background Voice Recognition Thread ---
@@ -324,8 +588,13 @@ def identify_speaker(encoder, audio_int16, voice_profiles):
 
 
 def parse_voice_command(text):
-    """Checks if spoken text contains a forceful open or close command."""
+    """Checks if spoken text contains a stop, open, or close command."""
     cleaned = text.lower().strip()
+    words = cleaned.split()
+
+    # Check STOP first (highest priority)
+    if any(cmd in cleaned for cmd in STOP_COMMANDS) or "stop" in words:
+        return "stop"
     if any(cmd in cleaned for cmd in OPEN_COMMANDS):
         return "force_open"
     if any(cmd in cleaned for cmd in CLOSE_COMMANDS):
@@ -370,7 +639,7 @@ def voice_listener_worker(voice_profiles):
             channels=1,
             callback=audio_callback
         ):
-            print("[VOICE] Continuous microphone listener active. Say 'open door' or 'close door'.", flush=True)
+            print("[VOICE] Listener active. Commands: 'open door', 'close door', 'stop'.", flush=True)
 
             while not stop_event.is_set():
                 try:
@@ -391,7 +660,6 @@ def voice_listener_worker(voice_profiles):
                     text = result.get("text", "").strip()
 
                     if text:
-                        # Convert bytearray to immutable bytes() first to prevent BufferError
                         pcm_bytes = bytes(current_phrase_pcm)
                         audio_np = np.frombuffer(pcm_bytes, dtype=np.int16)
 
@@ -408,7 +676,9 @@ def voice_listener_worker(voice_profiles):
                         if speaker == "Too Short":
                             pass
                         elif speaker != "Unknown" and authority >= MIN_AUTHORITY:
-                            if command_action == "force_open":
+                            if command_action == "stop":
+                                halt_door_immediately(speaker, authority, source="Voice Command")
+                            elif command_action == "force_open":
                                 trigger_door_async(
                                     speaker, authority, source="Voice Command", action="force_open", force=True
                                 )
@@ -417,7 +687,6 @@ def voice_listener_worker(voice_profiles):
                                     speaker, authority, source="Voice Command", action="force_close", force=True
                                 )
                             else:
-                                # Spoken phrase without a specific command triggers standard door cycle
                                 trigger_door_async(
                                     speaker, authority, source="Voice", action="cycle", force=False
                                 )
@@ -425,10 +694,28 @@ def voice_listener_worker(voice_profiles):
                             if not is_door_busy:
                                 speak_vn_async("cút ra ngoài")
 
-                    # Reset buffer cleanly for next phrase
                     current_phrase_pcm = bytearray()
                 else:
-                    partial = json.loads(recognizer.PartialResult()).get("partial", "")
+                    partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
+
+                    # Fast-path: If the door is currently moving/waiting and user says "stop",
+                    # verify speaker and halt immediately without waiting for sentence completion!
+                    if is_door_busy and parse_voice_command(partial) == "stop":
+                        pcm_bytes = bytes(current_phrase_pcm)
+                        audio_np = np.frombuffer(pcm_bytes, dtype=np.int16)
+                        speaker, authority, confidence = identify_speaker(
+                            encoder, audio_np, voice_profiles
+                        )
+                        if speaker != "Unknown" and speaker != "Too Short" and authority >= MIN_AUTHORITY:
+                            print(
+                                f"[VOICE FAST-STOP] Heard ({speaker} | Auth {authority} | Sim {confidence:.2f}): '{partial}'",
+                                flush=True
+                            )
+                            halt_door_immediately(speaker, authority, source="Fast Voice Command")
+                            current_phrase_pcm = bytearray()
+                            recognizer.Reset()
+                            continue
+
                     if not partial and len(current_phrase_pcm) > max_silence_bytes:
                         current_phrase_pcm = bytearray(current_phrase_pcm[-(SAMPLE_RATE * 2):])
 
@@ -457,9 +744,9 @@ def main():
     known_encodings, known_names, known_authorities = load_known_faces(FACES_DIR)
     voice_profiles = load_known_voices(VOICES_DIR)
 
-    if not known_encodings and not voice_profiles:
-        print("[ERROR] Neither faces nor voices are enrolled! Run enroll.py first. Exiting.", flush=True)
-        return
+    # Start background schedule worker
+    sched_thread = threading.Thread(target=schedule_worker, daemon=True)
+    sched_thread.start()
 
     # Start continuous voice recognition in background thread
     voice_thread = threading.Thread(
@@ -469,17 +756,15 @@ def main():
     )
     voice_thread.start()
 
-    # Open camera if faces are enrolled
-    video_capture = None
-    if known_encodings:
-        print("[INFO] Opening USB webcam stream...", flush=True)
-        video_capture = cv2.VideoCapture(CAMERA_INDEX)
-        video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Open camera (also needed for Guest Mode even if no faces are enrolled yet)
+    print("[INFO] Opening USB webcam stream...", flush=True)
+    video_capture = cv2.VideoCapture(CAMERA_INDEX)
+    video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-        if not video_capture.isOpened():
-            print("[WARN] Could not open USB webcam. Running in Voice-Only mode.", flush=True)
-            video_capture = None
+    if not video_capture.isOpened():
+        print("[WARN] Could not open USB webcam. Running in Voice & Schedule mode only.", flush=True)
+        video_capture = None
 
     print("[INFO] System active. Listening & watching continuously. Press Ctrl+C to exit.", flush=True)
     frame_count = 0
@@ -501,25 +786,42 @@ def main():
                 rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
                 face_locations = face_recognition.face_locations(rgb_small_frame)
-                face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-                for face_encoding in face_encodings:
-                    matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.5)
-                    name = "Unknown"
-                    authority = 0
+                if face_locations:
+                    guest_active, guest_act_dur, guest_wait_dur = get_guest_mode_status()
 
-                    face_distances = face_recognition.face_distance(known_encodings, face_encoding)
-                    if len(face_distances) > 0:
-                        best_match_index = np.argmin(face_distances)
-                        if matches[best_match_index]:
-                            name = known_names[best_match_index]
-                            authority = known_authorities[best_match_index]
+                    if guest_active:
+                        # Guest Mode: Any face detected unlocks the door & greets without name
+                        trigger_door_async(
+                            person_name="Guest",
+                            authority=MIN_AUTHORITY,
+                            source="Guest Mode Face",
+                            action="guest_cycle",
+                            force=False,
+                            custom_actuator_duration=guest_act_dur,
+                            custom_open_delay=guest_wait_dur
+                        )
+                    elif known_encodings:
+                        # Standard Mode: Match against enrolled faces
+                        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
-                    if name != "Unknown" and authority >= MIN_AUTHORITY:
-                        trigger_door_async(name, authority, source="Face", action="cycle", force=False)
-                    else:
-                        if not is_door_busy:
-                            speak_vn_async("cút ra ngoài")
+                        for face_encoding in face_encodings:
+                            matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.5)
+                            name = "Unknown"
+                            authority = 0
+
+                            face_distances = face_recognition.face_distance(known_encodings, face_encoding)
+                            if len(face_distances) > 0:
+                                best_match_index = np.argmin(face_distances)
+                                if matches[best_match_index]:
+                                    name = known_names[best_match_index]
+                                    authority = known_authorities[best_match_index]
+
+                            if name != "Unknown" and authority >= MIN_AUTHORITY:
+                                trigger_door_async(name, authority, source="Face", action="cycle", force=False)
+                            else:
+                                if not is_door_busy:
+                                    speak_vn_async("cút ra ngoài")
 
             if DISPLAY_VIDEO:
                 cv2.imshow("RPi5 Face & Voice Access Control", frame)
