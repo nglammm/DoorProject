@@ -13,7 +13,7 @@ try:
         sleep(1.5)
         servo.angle = 90
         sleep(1.5)
-        servo.angle = 170
+        servo.angle = 160
         sleep(1.5)
 
 except KeyboardInterrupt:
