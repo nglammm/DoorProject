@@ -4,8 +4,8 @@ import argparse
 import threading
 import RPi.GPIO as GPIO
 
-RELAY_1 = 23
-RELAY_2 = 24
+RELAY_1 = 24
+RELAY_2 = 23
 
 def init_gpio():
     """Initializes pins once with relays OFF (Active-LOW: HIGH = OFF)."""
