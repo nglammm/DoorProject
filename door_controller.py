@@ -13,6 +13,7 @@ import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer, SetLogLevel
 from resemblyzer import VoiceEncoder, preprocess_wav
+from gpiozero import Button
 
 from voice import say
 from actuator_control import extend, retract, stop_actuator, cleanup_gpio
@@ -31,6 +32,10 @@ MIN_AUTHORITY = 2
 PROCESS_EVERY_N_FRAMES = 4
 DISPLAY_VIDEO = False
 TTS_COOLDOWN = 6.0
+
+# Button Configuration
+BUTTON_PIN = 22
+BUTTON_BOUNCE_TIME = 0.15  # 150ms debounce to prevent accidental double-triggers
 
 # Voice Configuration
 SAMPLE_RATE = 16000
@@ -54,6 +59,14 @@ door_abort_event = threading.Event()
 door_lock = threading.Lock()
 is_door_busy = False
 current_door_thread = None
+
+# Tracks door state & last movement direction for the physical button toggle:
+# door_state: "open", "pause", or "close"
+# last_move_direction: "open" or "close" (defaults to "close" so 1st press opens the door)
+button_state_lock = threading.Lock()
+door_state = "close"
+last_move_direction = "close"
+door_button = None
 
 tts_lock = threading.Lock()
 is_speaking = False
@@ -221,10 +234,20 @@ def load_known_voices(directory):
 
 # --- Door Control (Cycle, Guest Cycle, Force Open/Close, & Immediate Stop) ---
 
+def _set_door_movement_state(new_state, direction=None):
+    """Thread-safe helper to keep door_state and last_move_direction synchronized."""
+    global door_state, last_move_direction
+    with button_state_lock:
+        door_state = new_state
+        if direction in ("open", "close"):
+            last_move_direction = direction
+
+
 def halt_door_immediately(person_name, authority, source="Voice Command"):
     """Immediately stops the door actuator and aborts any active door thread."""
     global is_door_busy
     print(f"\n[STOP COMMAND via {source}] {person_name} (Authority: {authority}) ordered STOP DOOR!", flush=True)
+    _set_door_movement_state("pause")
     door_abort_event.set()
     stop_actuator()
     speak_vn_async(f"Đã dừng cửa theo lệnh của {person_name}", force=True)
@@ -254,6 +277,7 @@ def operate_door(
 
     try:
         if action == "force_open":
+            _set_door_movement_state("open", direction="open")
             print(f"\n[FORCE OPEN via {source}] {person_name} (Authority: {authority}) ordered OPEN DOOR!", flush=True)
             speak_vn_async(f"Đang mở cửa theo lệnh của {person_name}", force=True)
 
@@ -266,6 +290,7 @@ def operate_door(
                 print("[DOOR] Force-open halted mid-operation.\n", flush=True)
 
         elif action == "force_close":
+            _set_door_movement_state("close", direction="close")
             print(f"\n[FORCE CLOSE via {source}] {person_name} (Authority: {authority}) ordered CLOSE DOOR!", flush=True)
             speak_vn_async(f"Đang đóng cửa theo lệnh của {person_name}", force=True)
 
@@ -281,6 +306,7 @@ def operate_door(
             print(f"\n[GUEST ACCESS via {source}] Welcoming visitor (No name).", flush=True)
             speak_vn_async("Xin chào quý khách, mời vào", force=True)
 
+            _set_door_movement_state("open", direction="open")
             print(f"[DOOR] Opening door for {act_dur}s...", flush=True)
             retract(duration=act_dur, stop_event=active_event)
 
@@ -295,6 +321,7 @@ def operate_door(
                 print("[DOOR] Guest door cycle halted during wait.\n", flush=True)
                 return
 
+            _set_door_movement_state("close", direction="close")
             print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
             extend(duration=act_dur, stop_event=active_event)
 
@@ -305,6 +332,7 @@ def operate_door(
             print(f"\n[SCHEDULED OPEN] Opening door for {act_dur}s, holding {wait_dur}s...", flush=True)
             speak_vn_async("Đang mở cửa theo lịch trình", force=True)
 
+            _set_door_movement_state("open", direction="open")
             retract(duration=act_dur, stop_event=active_event)
             if active_event.is_set():
                 return
@@ -314,6 +342,7 @@ def operate_door(
             if active_event.is_set():
                 return
 
+            _set_door_movement_state("close", direction="close")
             print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
             extend(duration=act_dur, stop_event=active_event)
 
@@ -325,6 +354,7 @@ def operate_door(
             print(f"\n[ACCESS GRANTED via {source}] Welcome {person_name} (Authority: {authority}).", flush=True)
             speak_vn_async(f"Chào mừng {person_name} trở về", force=True)
 
+            _set_door_movement_state("open", direction="open")
             print(f"[DOOR] Opening door for {act_dur}s...", flush=True)
             retract(duration=act_dur, stop_event=active_event)
 
@@ -339,6 +369,7 @@ def operate_door(
                 print("[DOOR] Door cycle halted during wait.\n", flush=True)
                 return
 
+            _set_door_movement_state("close", direction="close")
             print(f"[DOOR] Closing door for {act_dur}s...", flush=True)
             extend(duration=act_dur, stop_event=active_event)
 
@@ -408,6 +439,72 @@ def trigger_door_async(
                 daemon=True
             )
             current_door_thread.start()
+
+
+# --- Physical Push Button Toggle Handler ---
+
+def on_button_pressed():
+    """
+    Cycles through the 3 door states on each button press:
+      - If door is currently active/moving -> PAUSE (stop immediately)
+      - If door is paused or idle:
+          * If last direction was 'close' -> OPEN (force_open)
+          * If last direction was 'open'  -> CLOSE (force_close)
+    """
+    if stop_event.is_set():
+        return
+
+    with door_lock:
+        busy = is_door_busy
+
+    if busy:
+        # Door is actively opening, waiting, or closing -> transition to PAUSE
+        print(f"\n[BUTTON] Pressed while door active -> Toggling state to: PAUSE", flush=True)
+        trigger_door_async(
+            person_name="nút bấm",
+            authority=999,
+            source="Physical Button",
+            action="stop",
+            force=True
+        )
+    else:
+        # Door is stopped/paused or completed -> toggle to the opposite direction
+        with button_state_lock:
+            prev_dir = last_move_direction
+
+        if prev_dir == "close":
+            print(f"\n[BUTTON] Pressed while idle/paused -> Toggling state to: OPEN", flush=True)
+            trigger_door_async(
+                person_name="nút bấm",
+                authority=999,
+                source="Physical Button",
+                action="force_open",
+                force=True
+            )
+        else:
+            print(f"\n[BUTTON] Pressed while idle/paused -> Toggling state to: CLOSE", flush=True)
+            trigger_door_async(
+                person_name="nút bấm",
+                authority=999,
+                source="Physical Button",
+                action="force_close",
+                force=True
+            )
+
+
+def init_button():
+    """Initializes the physical push button on GPIO 22."""
+    global door_button
+    try:
+        door_button = Button(BUTTON_PIN, pull_up=False, bounce_time=BUTTON_BOUNCE_TIME)
+        door_button.when_pressed = on_button_pressed
+        print(
+            f"[BUTTON] Initialized on GPIO {BUTTON_PIN} "
+            f"(3-state toggle: OPEN -> PAUSE -> CLOSE -> PAUSE).",
+            flush=True
+        )
+    except Exception as e:
+        print(f"[BUTTON ERROR] Could not initialize button on GPIO {BUTTON_PIN}: {e}", flush=True)
 
 
 # --- Schedule System Worker ---
@@ -728,10 +825,16 @@ def voice_listener_worker(voice_profiles):
 
 def shutdown(signum=None, frame=None):
     """Coordinated shutdown routine."""
+    global door_button
     print("\n[INFO] Shutdown signal received. Halting hardware...", flush=True)
     stop_event.set()
     door_abort_event.set()
     stop_actuator()
+    if door_button is not None:
+        try:
+            door_button.close()
+        except Exception:
+            pass
     cleanup_gpio()
     if signum is not None:
         sys.exit(0)
@@ -743,6 +846,9 @@ def main():
 
     known_encodings, known_names, known_authorities = load_known_faces(FACES_DIR)
     voice_profiles = load_known_voices(VOICES_DIR)
+
+    # Initialize physical push button on GPIO 22
+    init_button()
 
     # Start background schedule worker
     sched_thread = threading.Thread(target=schedule_worker, daemon=True)
@@ -763,7 +869,7 @@ def main():
     video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     if not video_capture.isOpened():
-        print("[WARN] Could not open USB webcam. Running in Voice & Schedule mode only.", flush=True)
+        print("[WARN] Could not open USB webcam. Running in Voice, Button & Schedule mode only.", flush=True)
         video_capture = None
 
     print("[INFO] System active. Listening & watching continuously. Press Ctrl+C to exit.", flush=True)
