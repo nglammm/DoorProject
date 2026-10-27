@@ -4,7 +4,7 @@ from signal import pause
 
 # Most 3-pin modules have an internal pull-down resistor, meaning OUT goes HIGH when pressed.
 # pull_up=False configures the input to expect an active-HIGH signal.
-btn = Button(27, pull_up=False)
+btn = Button(22, pull_up=False)
 
 def on_press():
     print("Button pressed!")
